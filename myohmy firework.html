@@ -1,0 +1,482 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>60秒高頻多樣煙火循環秀</title>
+    <style>
+        body, html { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background-color: #000; }
+        canvas { display: block; background-color: #000; }
+    </style>
+</head>
+<body>
+    <canvas id="fireworksCanvas"></canvas>
+
+    <script>
+        const canvas = document.getElementById('fireworksCanvas');
+        const ctx = canvas.getContext('2d');
+        let activeFireworks = []; // 儲存螢幕上活動中的煙火實例
+        let vw, vh;
+        let mainLoopTimer = 0; // 主循環計時器 (0 to sequenceDuration)
+        let sequenceIndex = 0; // 當前播放到序列的哪個位置
+        let lastTime = 0; // 用於計算 delta time
+
+        // --- 核心設定 ---
+        const sequenceDuration = 60000; // 60 秒 (毫秒)
+        const targetFireworksPerSequence = 800; // 60秒內目標煙火數量 (平衡要求和性能) ~13/秒
+        const gravity = 0.03;
+        const friction = 0.98;
+        const trailLength = 8; // 拖尾透明度因子 (0-100)
+
+        // --- 顏色庫 ---
+        const colors = [
+            // 暖色
+            '#FF4848', '#FF7648', '#FFA548', '#FFD048', '#FFFF48',
+            // 冷色
+            '#48FFFF', '#48D1FF', '#48A5FF', '#4876FF', '#4848FF', '#7648FF',
+            // 綠色/青色
+            '#48FF48', '#48FF76', '#48FFA5', '#48FFD1',
+            // 粉色/紫色
+            '#FF48FF', '#FF48D1', '#FF48A5', '#D148FF', '#A548FF',
+            // 特殊
+            '#FFFFFF', '#F0F0F0', // 白色/亮灰 (可用於閃爍)
+            '#FFD700' // 金色 (垂柳常用)
+        ];
+
+        // --- 煙火類型標識 (用於生成序列和爆炸邏輯) ---
+        const fireworkTypes = [
+            'sphere_mono', 'sphere_multi', 'sphere_rainbow', // 球形 (單色/多色/彩虹)
+            'willow_gold', 'willow_multi',                  // 垂柳 (金色/多色)
+            'glitter_fast', 'glitter_dense',               // 閃爍 (快速/密集)
+            'strobe_mono', 'strobe_multi',                  // 頻閃 (單色/多色)
+            'ring_simple',                                  // 環狀 (嘗試)
+            'burst_directional',                           // 定向爆發 (嘗試)
+            'sphere_compact', 'sphere_large'                // 緊湊球型 / 大型球型
+        ];
+
+        // --- 預生成 60 秒煙火序列 ---
+        let fireworkSequence = [];
+
+        function generateSequence() {
+            console.log("Generating 60s firework sequence...");
+            fireworkSequence = []; // 清空舊序列
+            for (let i = 0; i < targetFireworksPerSequence; i++) {
+                const launchTime = Math.random() * sequenceDuration;
+                const xPos = random(0.1, 0.9); // 相對位置 (0 to 1)
+                const type = fireworkTypes[Math.floor(Math.random() * fireworkTypes.length)];
+                const launchSpeed = random(-12, -16); // 更快的發射速度
+                const targetHeightFactor = random(0.15, 0.5); // 爆炸高度因子 (vh * factor)
+
+                fireworkSequence.push({
+                    time: launchTime,
+                    x: xPos,
+                    type: type,
+                    launchSpeed: launchSpeed,
+                    targetHeight: targetHeightFactor * vh // 計算絕對目標高度
+                });
+            }
+            // 必須按時間排序!
+            fireworkSequence.sort((a, b) => a.time - b.time);
+            console.log(`Generated ${fireworkSequence.length} firework events.`);
+            sequenceIndex = 0; // 重置播放索引
+        }
+
+
+        // --- 輔助函數 ---
+        function random(min, max) { return Math.random() * (max - min) + min; }
+        function randomInt(min, max) { return Math.floor(random(min, max + 1)); }
+        function randomColor(palette = colors) { return palette[Math.floor(Math.random() * palette.length)]; }
+        function getColors(type) {
+            let count = randomInt(1,3);
+            let palette = colors;
+            if (type.includes('mono')) count = 1;
+            if (type.includes('multi')) count = randomInt(2, 4);
+            if (type.includes('rainbow')) return colors.slice(0, 7); // 取經典彩虹七色
+            if (type.includes('gold')) return ['#FFD700', '#FFA500']; // 金色系
+
+            // Pick distinct colors
+            const shuffled = palette.slice().sort(() => 0.5 - Math.random());
+            return shuffled.slice(0, count);
+        }
+
+        // --- 粒子類別 ---
+        class Particle {
+            constructor(x, y, vx, vy, color, life, particleType = 'normal', options = {}) {
+                this.x = x;
+                this.y = y;
+                this.vx = vx;
+                this.vy = vy;
+                this.color = color;
+                this.initialLife = life;
+                this.life = life;
+                this.alpha = 1;
+                this.type = particleType; // 'normal', 'strobe', 'trail_source'
+                this.gravity = gravity * (options.gravityFactor || 1); // 可調整重力影響
+                this.friction = options.friction || friction;
+                this.strobeRate = options.strobeRate || 0.1;
+                this.strobeIntensity = options.strobeIntensity || 0.5;
+                this.radius = options.radius || random(1.5, 2.5);
+                 this.decay = random(0.01, 0.02) * (options.decayRate || 1);
+            }
+
+            update(deltaTime) {
+                 // Correct deltaTime calculation: should be passed from animate loop
+                 const dt = deltaTime / 16.67; // Normalize to roughly 60fps update step
+
+                 this.x += this.vx * dt;
+                 this.y += this.vy * dt;
+                 this.vy += this.gravity * dt; // Apply gravity
+
+                 this.vx *= Math.pow(this.friction, dt); // Apply friction scaled by dt
+                 this.vy *= Math.pow(this.friction, dt);
+
+                 this.life -= this.decay * dt;
+
+                // Alpha calculation
+                if (this.type === 'strobe') {
+                    if (Math.random() < this.strobeRate) {
+                         // Rapid alpha change for strobe
+                        this.alpha = random(1 - this.strobeIntensity, 1);
+                    } else {
+                         // Tend back towards default fade
+                        this.alpha = Math.max(0, this.life / (this.initialLife * 0.5));
+                    }
+                    this.alpha = Math.max(0, Math.min(1, this.alpha)); // Clamp alpha
+                } else {
+                    // Normal fade: quicker fade towards the end
+                    this.alpha = Math.max(0, this.life / (this.initialLife * 0.5));
+                }
+
+                // Simplified secondary burst for 'trail_source' (potential future use)
+                // if (this.type === 'trail_source' && this.life < this.initialLife * 0.5 && Math.random() < 0.05) {
+                //   // Spawn tiny trail particle logic here - skip for now due to complexity/performance
+                // }
+            }
+
+            draw() {
+                ctx.globalAlpha = this.alpha;
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fill();
+                 // No need to reset globalAlpha here, handled in main loop
+            }
+
+            shouldRemove() {
+                return this.life <= 0 || this.alpha <= 0;
+            }
+        }
+
+        // --- 煙火類別 ---
+        class Firework {
+            constructor(startX, targetHeight, launchSpeed, type) {
+                this.startX = startX;
+                this.targetHeight = targetHeight; // Absolute Y coordinate to explode near
+                this.type = type;
+                this.exploded = false;
+                this.particles = []; // Explosion particles
+
+                 // Rocket properties (less visible now, mainly for positioning explosion)
+                 this.rocket = {
+                     x: startX,
+                     y: vh,
+                     vx: random(-1, 1),
+                     vy: launchSpeed,
+                     alpha: 1,
+                     color: 'rgba(255,255,255,0.5)' // Faint rocket trail color
+                 };
+                 this.trailParticles = []; // Visual trail for rocket
+
+                // Pre-calculate explosion parameters based on type
+                this.explosionParams = this.getExplosionParams(type);
+                this.explosionColors = getColors(type);
+            }
+
+            getExplosionParams(type) {
+                let params = {
+                    count: randomInt(80, 150),
+                    speed: random(3, 8),
+                    life: random(0.8, 1.8),
+                    particleType: 'normal',
+                    gravityFactor: 1,
+                    radius: random(1.5, 2.5),
+                    decayRate: 1,
+                    shape: 'sphere', // 'sphere', 'ring', 'directional'
+                    angleRange: [0, Math.PI * 2] // for ring/directional
+                };
+
+                if (type.includes('willow')) {
+                    params.count = randomInt(60, 120);
+                    params.speed = random(1, 4);
+                    params.life = random(2.0, 3.5); // Longer life
+                    params.gravityFactor = 1.2; // More affected by gravity
+                    params.decayRate = 0.8; // Fades slower
+                    params.radius = random(1, 2);
+                } else if (type.includes('glitter')) {
+                    params.count = randomInt(150, 300);
+                    params.speed = random(4, 9);
+                    params.life = random(0.3, 0.8); // Short life
+                    params.decayRate = 1.5; // Fades faster
+                    params.radius = random(0.8, 1.5);
+                } else if (type.includes('strobe')) {
+                     params.particleType = 'strobe';
+                     params.life = random(0.6, 1.5);
+                     params.strobeRate = 0.2;
+                     params.strobeIntensity = 0.6;
+                } else if (type.includes('ring')) {
+                    params.shape = 'ring';
+                    const ringStart = Math.random() * Math.PI * 2;
+                    const ringWidth = random(Math.PI * 0.2, Math.PI * 0.5); // Adjust for thickness
+                    params.angleRange = [ringStart, ringStart + ringWidth];
+                    params.count = randomInt(100, 180); // Ring might need more particles
+                    params.speed = random(4, 7);
+                } else if (type.includes('directional')) {
+                     params.shape = 'directional';
+                     const direction = Math.random() * Math.PI * 2;
+                     const spread = random(Math.PI * 0.3, Math.PI * 0.8);
+                     params.angleRange = [direction - spread / 2, direction + spread / 2];
+                     params.speed = random(6, 11); // Faster directional burst
+                }
+                 if(type.includes('compact')) {
+                     params.speed = random(2, 5);
+                     params.life = random(0.6, 1.2);
+                     params.count = randomInt(60,100);
+                 }
+                 if(type.includes('large')) {
+                     params.speed = random(5, 10);
+                     params.life = random(1.5, 2.5);
+                     params.count = randomInt(120, 200);
+                 }
+
+
+                return params;
+            }
+
+            update(deltaTime) {
+                const dt = deltaTime / 16.67; // Normalize update step
+
+                if (!this.exploded) {
+                    // Update rocket position
+                    this.rocket.x += this.rocket.vx * dt;
+                    this.rocket.y += this.rocket.vy * dt;
+                    this.rocket.vy += gravity * dt; // Rocket also affected by gravity
+
+                     // Add trail particle occasionally
+                    if(Math.random() < 0.5) {
+                        this.trailParticles.push(new Particle(
+                           this.rocket.x, this.rocket.y,
+                           random(-0.3, 0.3), random(-0.3, 0.3), // Trail spread
+                           this.rocket.color,
+                           random(0.3, 0.7), // Short trail life
+                           'normal',
+                           { radius: 1.5, decayRate: 1.8 }
+                        ));
+                    }
+
+
+                    // Check explosion condition (reaching target height zone OR moving upwards slower)
+                    if (this.rocket.y <= this.targetHeight || this.rocket.vy >= -1) {
+                        this.explode();
+                    }
+                }
+
+                 // Update explosion particles
+                 for (let i = this.particles.length - 1; i >= 0; i--) {
+                     this.particles[i].update(deltaTime);
+                     if (this.particles[i].shouldRemove()) {
+                         this.particles.splice(i, 1);
+                     }
+                 }
+                  // Update trail particles
+                 for (let i = this.trailParticles.length - 1; i >= 0; i--) {
+                     this.trailParticles[i].update(deltaTime);
+                     if (this.trailParticles[i].shouldRemove()) {
+                         this.trailParticles.splice(i, 1);
+                     }
+                 }
+
+            }
+
+            draw() {
+                 // Draw Trail
+                 ctx.globalAlpha = 0.6; // Trail less prominent
+                 this.trailParticles.forEach(p => p.draw());
+
+                if (!this.exploded && this.rocket.alpha > 0) {
+                     // Draw faint rocket if needed (optional)
+                     // ctx.globalAlpha = this.rocket.alpha;
+                     // ctx.fillStyle = this.rocket.color;
+                     // ctx.beginPath();
+                     // ctx.arc(this.rocket.x, this.rocket.y, 1.5, 0, Math.PI * 2);
+                     // ctx.fill();
+                }
+
+                // Draw Explosion Particles
+                ctx.globalAlpha = 1; // Reset for main particles
+                this.particles.forEach(p => p.draw());
+                 // IMPORTANT: Reset globalAlpha after all drawing in the loop
+                 ctx.globalAlpha = 1;
+            }
+
+            explode() {
+                if (this.exploded) return; // Prevent multiple explosions
+                this.exploded = true;
+                this.rocket.alpha = 0; // Make rocket invisible
+
+                const explosionX = this.rocket.x;
+                const explosionY = this.rocket.y;
+                const params = this.explosionParams;
+
+                for (let i = 0; i < params.count; i++) {
+                    let angle;
+                    if (params.shape === 'sphere') {
+                        angle = Math.random() * Math.PI * 2;
+                    } else if (params.shape === 'ring') {
+                        // Generate angles within the allowed range
+                         angle = params.angleRange[0] + Math.random() * (params.angleRange[1] - params.angleRange[0]);
+                         // Allow wrapping around if range crosses 0/2PI (simplified: just use range)
+                         if (params.angleRange[1] < params.angleRange[0]){ // handles wrap around case e.g. 1.8PI to 0.2PI
+                             if(Math.random() > (Math.PI*2 - params.angleRange[0]) / (Math.PI*2 - params.angleRange[0] + params.angleRange[1]) ){
+                                 angle = Math.random()*params.angleRange[1];
+                             } else {
+                                 angle = params.angleRange[0] + Math.random()*(Math.PI*2 - params.angleRange[0]);
+                             }
+                         }
+                    } else if (params.shape === 'directional') {
+                        angle = params.angleRange[0] + Math.random() * (params.angleRange[1] - params.angleRange[0]);
+                    } else { // Default to sphere
+                         angle = Math.random() * Math.PI * 2;
+                    }
+
+
+                    const speed = random(0.5, 1.0) * params.speed * (Math.random() > 0.9 ? 1.5 : 1); // Speed variation, occasional faster ones
+                    const vx = Math.cos(angle) * speed;
+                    const vy = Math.sin(angle) * speed;
+                    const color = this.explosionColors.length > 0 ? this.explosionColors[i % this.explosionColors.length] : randomColor();
+                    const life = random(0.8, 1.2) * params.life; // Vary life slightly around base
+
+                    this.particles.push(new Particle(
+                        explosionX, explosionY,
+                        vx, vy, color, life,
+                        params.particleType,
+                        {
+                            gravityFactor: params.gravityFactor,
+                            radius: params.radius,
+                            decayRate: params.decayRate,
+                             strobeRate: params.strobeRate,
+                             strobeIntensity: params.strobeIntensity,
+                        }
+                    ));
+                }
+                 // Clear trail particles faster after explosion maybe
+                 this.trailParticles.forEach(p => { p.life *= 0.5; });
+            }
+
+            shouldRemove() {
+                // Remove firework instance if exploded and all particles (explosion + trail) are gone
+                return this.exploded && this.particles.length === 0 && this.trailParticles.length === 0;
+            }
+        }
+
+
+        // --- Main Animation Loop ---
+        function animate(currentTime) {
+             requestAnimationFrame(animate);
+
+             // Calculate delta time
+             if (!lastTime) lastTime = currentTime;
+             const deltaTime = currentTime - lastTime;
+             lastTime = currentTime;
+
+             if (isNaN(deltaTime) || deltaTime <= 0 || deltaTime > 100) { // Skip large jumps or invalid delta
+                 return;
+             }
+
+             // Update main loop timer
+             mainLoopTimer += deltaTime;
+
+             // Check for loop reset
+             if (mainLoopTimer >= sequenceDuration) {
+                 console.log("Looping sequence...");
+                 mainLoopTimer %= sequenceDuration; // Use modulo to keep remainder
+                 sequenceIndex = 0; // Reset sequence playback index
+                 // Optional: Clear existing fireworks for a cleaner loop, or let them fade
+                 // activeFireworks = [];
+             }
+
+             // --- Launch fireworks from sequence ---
+             while (sequenceIndex < fireworkSequence.length && fireworkSequence[sequenceIndex].time <= mainLoopTimer) {
+                 const event = fireworkSequence[sequenceIndex];
+                 const xPos = event.x * vw; // Calculate absolute X position
+                 // Adjust target height if window resized since generation
+                 const targetY = Math.min(event.targetHeight, vh * 0.8); // Prevent exploding too high if vh shrunk
+
+                 // Prevent launching if off-screen somehow (might happen on extreme resize)
+                 if (xPos > 0 && xPos < vw) {
+                      activeFireworks.push(new Firework(xPos, targetY, event.launchSpeed, event.type));
+                 }
+                 sequenceIndex++;
+             }
+
+
+            // --- Draw Background (with trail effect) ---
+            ctx.fillStyle = `rgba(0, 0, 0, ${trailLength / 100})`; // Lower alpha = longer trails
+            ctx.globalCompositeOperation = 'source-over'; // Ensure standard drawing mode
+            ctx.fillRect(0, 0, vw, vh);
+            ctx.globalCompositeOperation = 'lighter'; // Additive blending for brighter fireworks
+
+
+            // --- Update and Draw Active Fireworks ---
+            for (let i = activeFireworks.length - 1; i >= 0; i--) {
+                 activeFireworks[i].update(deltaTime);
+                 activeFireworks[i].draw();
+                 if (activeFireworks[i].shouldRemove()) {
+                     activeFireworks.splice(i, 1);
+                 }
+            }
+
+            // Reset blending mode and alpha for next frame
+             ctx.globalCompositeOperation = 'source-over';
+             ctx.globalAlpha = 1;
+
+        }
+
+        // --- Setup & Start ---
+        function setup() {
+             vw = canvas.width = window.innerWidth;
+             vh = canvas.height = window.innerHeight;
+             generateSequence(); // Generate the 60s sequence based on current screen size
+             mainLoopTimer = 0; // Reset timer
+             lastTime = 0; // Reset delta time tracking
+             activeFireworks = []; // Clear any existing fireworks
+             sequenceIndex = 0; // Reset sequence index
+             // Start the animation only after sequence is ready
+             requestAnimationFrame(animate);
+        }
+
+        // Handle resize
+        let resizeTimeout;
+        window.addEventListener('resize', () => {
+            clearTimeout(resizeTimeout);
+             // Debounce resize event - wait until user stops resizing
+             resizeTimeout = setTimeout(() => {
+                console.log("Resizing - Regenerating sequence...");
+                // Important: Regenerate sequence based on new dimensions
+                // otherwise targetHeight etc will be wrong.
+                vw = canvas.width = window.innerWidth;
+                vh = canvas.height = window.innerHeight;
+                generateSequence();
+                 mainLoopTimer = 0; // Reset timer on resize as sequence changed
+                 lastTime = 0;
+                 sequenceIndex = 0;
+                // Maybe clear active fireworks too for consistency
+                activeFireworks = [];
+             }, 500); // Wait 500ms after last resize event
+        });
+
+        // Initial setup
+        setup();
+
+    </script>
+</body>
+</html>
